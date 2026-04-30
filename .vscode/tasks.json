@@ -1,0 +1,39 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run WhatsApp Bot",
+      "type": "shell",
+      "command": "npm",
+      "args": ["start"],
+      "options": {
+        "shell": {
+          "executable": "bash.exe",
+          "args": ["-c", "export PATH=/c/Users/chemo/AppData/Roaming/nvm/v18.17.1:$PATH && (lsof -ti:3007 | xargs kill -9 2>/dev/null || true) && npm start"]
+        }
+      },
+      "windows": {
+        "command": "set PATH=C:\\Users\\chemo\\AppData\\Roaming\\nvm\\v18.17.1;%PATH% && set NODE_OPTIONS=--openssl-legacy-provider && (for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :3007 ^| findstr LISTENING') do taskkill /f /pid %a) 2>nul & npm start",
+        "options": {
+          "shell": {
+            "executable": "cmd.exe",
+            "args": ["/d", "/c"]
+          }
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      },
+      "isBackground": true,
+      "runOptions": { "runOn": "folderOpen" },
+      "problemMatcher": []
+    }
+  ]
+}
