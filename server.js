@@ -234,6 +234,16 @@ client.on('ready', () => {
   reconnectAttempts = 0;
   clientStatus = 'READY';
   lastQr = null;
+
+  // Persist the linked number so it can be retrieved even if disconnected
+  try {
+    const number = client.info.wid.user;
+    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+    fs.writeFileSync(path.join(AUTH_DIR, 'last_number.txt'), number);
+    console.log(`[INFO] Linked number persisted: ${number}`);
+  } catch (err) {
+    console.error('[ERROR] Failed to persist linked number:', err.message);
+  }
 });
 
 client.on('qr', qr => {
@@ -284,6 +294,14 @@ const normalizePhone = phone => {
 
 app.post('/api/send-message', authMiddleware, async (req, res) => {
   const { phone, message } = req.body;
+  
+  if (clientStatus !== 'READY') {
+    return res.status(503).json({ 
+      error: `Bot is not ready (Status: ${clientStatus}). Please visit the QR page to authenticate.`,
+      status: clientStatus 
+    });
+  }
+
   if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
 
   try {
@@ -292,7 +310,11 @@ app.post('/api/send-message', authMiddleware, async (req, res) => {
     return res.json({ id: sent.id._serialized });
   } catch (error) {
     console.error('Send message error', error);
-    return res.status(500).json({ error: error.message });
+    let message = error.message;
+    if (message.includes('getChat') || message.includes('undefined')) {
+      message = "WhatsApp Bot session is not active. Please scan the QR code to authenticate.";
+    }
+    return res.status(500).json({ error: message });
   }
 });
 
@@ -471,6 +493,38 @@ app.get('/reset', authMiddleware, async (req, res) => {
 app.get('/status', authMiddleware, (req, res) => {
   console.log(`[${new Date().toISOString()}] Status check from ${req.ip}`);
   res.json({ status: clientStatus, hasQr: !!lastQr });
+});
+
+app.get('/me', authMiddleware, (req, res) => {
+  // If fully ready, return live info
+  if (clientStatus === 'READY' && client.info) {
+    return res.json({ 
+      number: client.info.wid.user, 
+      name: client.info.pushname,
+      status: clientStatus 
+    });
+  }
+
+  // Fallback: Try to read last known number from persisted file
+  const lastNumberPath = path.join(AUTH_DIR, 'last_number.txt');
+  if (fs.existsSync(lastNumberPath)) {
+    try {
+      const number = fs.readFileSync(lastNumberPath, 'utf8');
+      return res.json({ 
+        number: number, 
+        name: 'Previously Linked Account', 
+        status: clientStatus,
+        is_fallback: true
+      });
+    } catch (err) {
+      // Ignore read errors
+    }
+  }
+
+  return res.status(503).json({ 
+    error: 'Client not ready and no stored session available', 
+    status: clientStatus 
+  });
 });
 
 const PORT = process.env.PORT || 3007;
