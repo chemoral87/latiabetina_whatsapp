@@ -4,15 +4,61 @@ import cors from 'cors';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
+import fs from 'fs';
+import path from 'path';
 
 const { Client, LocalAuth } = pkg;
+
+// ─── Config ────────────────────────────────────────────────────────────────
+const CLIENT_ID       = process.env.CLIENT_ID || 'latiabetina-bot';
+const AUTH_DIR        = path.resolve('.wwebjs_auth');
+const CACHE_DIR       = path.resolve('.wwebjs_cache');
+
+// How long (ms) to wait in LOADING before declaring it stuck and auto-resetting
+const LOADING_TIMEOUT_MS = 60_000; // 1 minute
+// Max reconnect attempts before giving up and wiping session
+const MAX_RECONNECT_ATTEMPTS = 3;
 
 // Load and verify API Password
 const API_PASSWORD = process.env.API_PASSWORD || 'admin123';
 console.log(`[AUTH] Security enabled with password: ${API_PASSWORD === 'admin123' ? 'admin123 (DEFAULT)' : '********'}`);
 
 let lastQr = null;
-let clientStatus = 'INITIALIZING'; // INITIALIZING, READY, QR_RECEIVED, AUTH_FAILURE, DISCONNECTED
+let clientStatus = 'INITIALIZING'; // INITIALIZING, LOADING, READY, QR_RECEIVED, AUTH_FAILURE, DISCONNECTED
+let reconnectAttempts = 0;
+let loadingWatchdog = null;   // Timer handle for LOADING stuck detection
+
+// ─── Session helpers ───────────────────────────────────────────────────────
+function wipeSession() {
+  console.log('[RECOVERY] Wiping stale session and cache...');
+  [AUTH_DIR, CACHE_DIR].forEach(dir => {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  console.log('[RECOVERY] Session wiped.');
+}
+
+function clearLoadingWatchdog() {
+  if (loadingWatchdog) { clearTimeout(loadingWatchdog); loadingWatchdog = null; }
+}
+
+function startLoadingWatchdog() {
+  clearLoadingWatchdog();
+  loadingWatchdog = setTimeout(() => {
+    if (clientStatus === 'LOADING' || clientStatus === 'INITIALIZING') {
+      console.warn(`[WATCHDOG] Stuck in ${clientStatus} for ${LOADING_TIMEOUT_MS / 1000}s — auto-resetting session.`);
+      reconnectAttempts++;
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.warn('[WATCHDOG] Max reconnect attempts reached — wiping session for fresh QR.');
+        wipeSession();
+        reconnectAttempts = 0;
+      }
+      clientStatus = 'RESTARTING';
+      lastQr = null;
+      try { client.destroy(); } catch (_) {}
+      setTimeout(() => client.initialize(), 2000);
+    }
+  }, LOADING_TIMEOUT_MS);
+}
 
 const app = express();
 app.use(cors());
@@ -169,40 +215,66 @@ const client = new Client({
 });
 
 client.on('loading_screen', (percent, message) => {
-  console.log('LOADING SCREEN', percent, message);
+  console.log(`[LOADING] ${percent}% — ${message}`);
   clientStatus = 'LOADING';
+  // Start watchdog every time we enter loading — resets the timer
+  startLoadingWatchdog();
 });
 
 client.on('authenticated', () => {
-  console.log('AUTHENTICATED');
+  console.log('[AUTH] Authenticated successfully');
+  clearLoadingWatchdog();
+  reconnectAttempts = 0;
   clientStatus = 'AUTHENTICATED';
 });
 
 client.on('ready', () => {
-  console.log('WhatsApp client ready');
+  console.log('[READY] WhatsApp client is ready');
+  clearLoadingWatchdog();
+  reconnectAttempts = 0;
   clientStatus = 'READY';
   lastQr = null;
 });
 
 client.on('qr', qr => {
-  console.log('QR CODE RECEIVED');
+  console.log('[QR] QR code received — scan with WhatsApp');
+  clearLoadingWatchdog(); // QR arrived = not stuck
   qrcode.generate(qr, { small: true });
   lastQr = qr;
   clientStatus = 'QR_RECEIVED';
 });
 
 client.on('auth_failure', msg => {
-  console.error('Auth failure', msg);
+  console.error('[AUTH_FAILURE]', msg);
   clientStatus = 'AUTH_FAILURE';
+  lastQr = null;
+  // Wipe bad session so next initialize shows a QR
+  wipeSession();
+  setTimeout(() => {
+    clientStatus = 'INITIALIZING';
+    startLoadingWatchdog();
+    client.initialize();
+  }, 3000);
 });
 
 client.on('disconnected', (reason) => {
-  console.log('Client was logged out', reason);
+  console.log('[DISCONNECTED]', reason);
+  clearLoadingWatchdog();
   clientStatus = 'DISCONNECTED';
   lastQr = null;
-  client.initialize();
+
+  const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 60_000); // exponential backoff, max 60s
+  reconnectAttempts++;
+  console.log(`[RECONNECT] Attempt ${reconnectAttempts} in ${delay / 1000}s...`);
+  setTimeout(() => {
+    clientStatus = 'INITIALIZING';
+    startLoadingWatchdog();
+    client.initialize();
+  }, delay);
 });
 
+// Start the initial watchdog before first initialize
+startLoadingWatchdog();
 client.initialize();
 
 const normalizePhone = phone => {
@@ -347,10 +419,53 @@ app.get('/logout', authMiddleware, async (req, res) => {
     clientStatus = 'DISCONNECTED';
     lastQr = null;
     res.send(`Logged out. <a href="/qr?pw=${req.query.pw}">Go back to QR</a>`);
-    setTimeout(() => client.initialize(), 1000);
+    setTimeout(() => {
+      clientStatus = 'INITIALIZING';
+      startLoadingWatchdog();
+      client.initialize();
+    }, 1000);
   } catch (err) {
     res.status(500).send('Logout failed: ' + err.message);
   }
+});
+
+// Manual recovery endpoint — wipes session + reinitializes for a fresh QR
+app.get('/reset', authMiddleware, async (req, res) => {
+  console.log('[RESET] Manual reset triggered via /reset endpoint');
+  clearLoadingWatchdog();
+  lastQr = null;
+  clientStatus = 'RESTARTING';
+  reconnectAttempts = 0;
+  try { await client.destroy(); } catch (_) {}
+  wipeSession();
+  setTimeout(() => {
+    clientStatus = 'INITIALIZING';
+    startLoadingWatchdog();
+    client.initialize();
+  }, 2000);
+  res.send(`
+    <html>
+      <head>
+        <title>Resetting...</title>
+        <meta http-equiv="refresh" content="5;url=/qr?pw=${req.query.pw}">
+        <style>
+          body { background: #0f172a; color: white; font-family: sans-serif;
+                 display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+          .card { background: rgba(255,255,255,0.05); padding: 2rem; border-radius: 1rem;
+                  text-align: center; border: 1px solid #f59e0b; max-width: 400px; }
+          h1 { color: #f59e0b; }
+          p { color: #94a3b8; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>🔄 Resetting Session</h1>
+          <p>Session wiped. Redirecting to QR page in 5 seconds...</p>
+          <p><a href="/qr?pw=${req.query.pw}" style="color:#38bdf8">Click here if not redirected</a></p>
+        </div>
+      </body>
+    </html>
+  `);
 });
 
 app.get('/status', authMiddleware, (req, res) => {
