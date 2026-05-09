@@ -1,0 +1,102 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      rollback_release:
+        description: "Rollback to release (leave empty for normal deploy)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Print trigger diagnostics
+        env:
+          COMMITS_PAYLOAD: ${{ toJson(github.event.commits) }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message || 'N/A (non-push event)' }}
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "ref=${{ github.ref }}"
+          echo "sha=${{ github.sha }}"
+          echo "actor=${{ github.actor }}"
+          echo "workflow=${{ github.workflow }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "run_attempt=${{ github.run_attempt }}"
+          echo "head_commit_message=$HEAD_COMMIT_MESSAGE"
+          echo "commits_payload=$COMMITS_PAYLOAD"
+          {
+            echo "### Trigger Diagnostics"
+            echo "- event_name: ${{ github.event_name }}"
+            echo "- ref: ${{ github.ref }}"
+            echo "- sha: ${{ github.sha }}"
+            echo "- actor: ${{ github.actor }}"
+            echo "- workflow: ${{ github.workflow }}"
+            echo "- run_id: ${{ github.run_id }}"
+            echo "- run_attempt: ${{ github.run_attempt }}"
+            echo "- head_commit_message: $HEAD_COMMIT_MESSAGE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Copy scripts to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: "scripts/"
+          target: "/var/www/whatsapbot/"
+          strip_components: 0
+
+      - name: Make scripts executable and trust GitHub host key
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            chmod +x /var/www/whatsapbot/scripts/*.sh
+            mkdir -p ~/.ssh
+            ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy or Rollback via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          command_timeout: 30m
+          script: |
+            if [ "${{ github.event.inputs.rollback_release }}" != "" ]; then
+              bash /var/www/whatsapbot/scripts/rollback_release.sh "${{ github.event.inputs.rollback_release }}"
+            else
+              bash /var/www/whatsapbot/scripts/deploy_release.sh ${{ github.sha }}
+            fi
+
+      - name: List available releases (for manual rollback)
+        if: github.event_name == 'workflow_dispatch'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            echo "=== Available releases ==="
+            ls -1t /var/www/whatsapbot/releases
+            echo "=== Current release ==="
+            readlink /var/www/whatsapbot/current
