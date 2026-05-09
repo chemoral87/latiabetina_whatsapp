@@ -1,6 +1,6 @@
 {
   "name": "latiabetina-whatsapp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WhatsApp automation service for Latiabetina",
   "type": "module",
   "main": "server.js",
