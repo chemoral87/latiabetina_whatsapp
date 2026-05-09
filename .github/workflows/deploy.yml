@@ -3,7 +3,7 @@ name: Deploy Whatsapp Bot to VPS
 on:
   push:
     branches:
-      - master
+      - main
   workflow_dispatch:
     inputs:
       rollback_release:
