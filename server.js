@@ -7,7 +7,7 @@ import QRCode from 'qrcode';
 import fs from 'fs';
 import path from 'path';
 
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, MessageMedia } = pkg;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const CLIENT_ID       = process.env.CLIENT_ID || 'latiabetina-bot';
@@ -315,6 +315,41 @@ app.post('/api/send-message', authMiddleware, async (req, res) => {
       message = "WhatsApp Bot session is not active. Please scan the QR code to authenticate.";
     }
     return res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/send-image', authMiddleware, async (req, res) => {
+  const { phone, message, mediaUrl, base64, mimetype, filename } = req.body;
+  
+  if (clientStatus !== 'READY') {
+    return res.status(503).json({ 
+      error: `Bot is not ready (Status: ${clientStatus}). Please visit the QR page to authenticate.`,
+      status: clientStatus 
+    });
+  }
+
+  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  if (!mediaUrl && !base64) return res.status(400).json({ error: 'mediaUrl or base64 is required' });
+
+  try {
+    const number = normalizePhone(phone);
+    let media;
+    
+    if (mediaUrl) {
+      media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+    } else {
+      media = new MessageMedia(mimetype || 'image/jpeg', base64, filename || 'image.jpg');
+    }
+
+    const sent = await client.sendMessage(number, media, { caption: message || '' });
+    return res.json({ id: sent.id._serialized });
+  } catch (error) {
+    console.error('Send image error', error);
+    let errorMsg = error.message;
+    if (errorMsg && (errorMsg.includes('getChat') || errorMsg.includes('undefined'))) {
+      errorMsg = "WhatsApp Bot session is not active. Please scan the QR code to authenticate.";
+    }
+    return res.status(500).json({ error: errorMsg });
   }
 });
 
