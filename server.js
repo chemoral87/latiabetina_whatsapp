@@ -1,4 +1,10 @@
 import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
 dotenv.config({ path: process.env.NODE_ENV === 'production' ? '.env.production' : '.env' });
 import express from 'express';
 import cors from 'cors';
@@ -6,17 +12,17 @@ import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import fs from 'fs';
-import path from 'path';
 
 const { Client, LocalAuth, MessageMedia } = pkg;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const CLIENT_ID       = process.env.CLIENT_ID || 'latiabetina-bot';
-const AUTH_DIR        = path.resolve('.wwebjs_auth');
-const CACHE_DIR       = path.resolve('.wwebjs_cache');
+const AUTH_DIR        = path.join(__dirname, '.wwebjs_auth');  // absolute — survives PM2 cwd changes
+const CACHE_DIR       = path.join(__dirname, '.wwebjs_cache'); // absolute — survives PM2 cwd changes
 
 // How long (ms) to wait in LOADING before declaring it stuck and auto-resetting
-const LOADING_TIMEOUT_MS = 60_000; // 1 minute
+// Raspberry Pi is slower than a VPS — give Chrome 3 min to start before wiping session
+const LOADING_TIMEOUT_MS = 180_000; // 3 minutes
 // Max reconnect attempts before giving up and wiping session
 const MAX_RECONNECT_ATTEMPTS = 3;
 
@@ -477,6 +483,8 @@ app.get('/logout', authMiddleware, async (req, res) => {
     await client.logout();
     clientStatus = 'DISCONNECTED';
     lastQr = null;
+    // Wipe saved session so next restart shows a fresh QR
+    wipeSession();
     res.send(`Logged out. <a href="/qr?pw=${req.query.pw}">Go back to QR</a>`);
     setTimeout(() => {
       clientStatus = 'INITIALIZING';
