@@ -211,6 +211,7 @@ const client = new Client({
   authStrategy: new LocalAuth({ clientId: process.env.CLIENT_ID || 'latiabetina-bot' }),
   puppeteer: { 
     headless: true,
+    executablePath: process.env.CHROME_BIN || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   },
 });
