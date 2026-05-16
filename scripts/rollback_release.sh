@@ -39,7 +39,7 @@ echo -e "${YELLOW}⏪ Rolling back to: $RELEASE_NAME${NC}"
 
 if [ -f "$APP_DIR/.env.production" ]; then
   echo -e "${YELLOW}📄 Copying .env.production file...${NC}"
-  cp -f "$APP_DIR/.env.production" "$RELEASE_PATH/.env" || error_exit "Failed to copy .env.production"
+  cp -f "$APP_DIR/.env.production" "$RELEASE_PATH/.env.production" || error_exit "Failed to copy .env.production"
 else
   echo -e "${YELLOW}⚠️ No .env.production file found at $APP_DIR/.env.production${NC}"
 fi
