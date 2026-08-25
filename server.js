@@ -1,11 +1,16 @@
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { createRequire } from 'module';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-dotenv.config({ path: process.env.NODE_ENV === 'production' ? '.env.production' : '.env' });
+// Load .env first, then .env.production overrides if NODE_ENV=production (so CHROME_BIN in .env is not ignored)
+dotenv.config({ path: path.join(__dirname, '.env') });
+if (process.env.NODE_ENV === 'production') {
+  dotenv.config({ path: path.join(__dirname, '.env.production'), override: true });
+}
 import express from 'express';
 import cors from 'cors';
 import pkg from 'whatsapp-web.js';
@@ -61,8 +66,14 @@ function startLoadingWatchdog() {
       }
       clientStatus = 'RESTARTING';
       lastQr = null;
-      try { client.destroy(); } catch (_) {}
-      setTimeout(() => client.initialize(), 2000);
+      try { if (typeof client !== 'undefined' && client) client.destroy(); } catch (_) {}
+      setTimeout(() => {
+        if (typeof safeInitialize === 'function') safeInitialize();
+        else client.initialize().catch(err => {
+          console.error('[FATAL] Failed to launch Chrome:', err.message);
+          clientStatus = 'FAILED'; clearLoadingWatchdog();
+        });
+      }, 2000);
     }
   }, LOADING_TIMEOUT_MS);
 }
@@ -213,13 +224,167 @@ const authMiddleware = (req, res, next) => {
   return res.status(401).json({ error: 'Unauthorized: Invalid password' });
 };
 
+// ─── Chrome executable resolver ────────────────────────────────────────────
+// whatsapp-web.js uses puppeteer under the hood. If executablePath is not
+// set, puppeteer tries to use its own cache (C:\Users\...\ .cache\puppeteer)
+// which is empty unless `npx puppeteer browsers install chrome` was run.
+// On Windows we have system Chrome; on Raspberry Pi we have chromium.
+// This resolver checks env vars first, then common install locations, then
+// puppeteer's cached binary.
+const _require = createRequire(import.meta.url);
+import { execSync } from 'child_process';
+
+let lastLaunchError = null; // surfaced on /qr and /status when FAILED
+
+function resolveChromePath() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env['PROGRAMFILES'] ? path.join(process.env['PROGRAMFILES'], 'Google', 'Chrome', 'Application', 'chrome.exe') : null,
+    process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe') : null,
+    // Edge (can run WhatsApp Web as fallback)
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe') : null,
+    process.env['PROGRAMFILES'] ? path.join(process.env['PROGRAMFILES'], 'Microsoft', 'Edge', 'Application', 'msedge.exe') : null,
+    // Linux / Pi
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+    '/usr/bin/microsoft-edge',
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  ].filter(Boolean);
+
+  // Dynamic lookup via where/which (handles custom install locations + PATH)
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync('where chrome 2>nul || where chrome.exe 2>nul || where msedge 2>nul || where msedge.exe 2>nul', { encoding: 'utf8', timeout: 3000 });
+      out.split(/\r?\n/).forEach(p => { const t = p.trim(); if (t) candidates.push(t); });
+    } else {
+      const out = execSync('which google-chrome-stable 2>/dev/null; which google-chrome 2>/dev/null; which chromium-browser 2>/dev/null; which chromium 2>/dev/null; which microsoft-edge 2>/dev/null', { encoding: 'utf8', timeout: 3000 });
+      out.split(/\r?\n/).forEach(p => { const t = p.trim(); if (t) candidates.push(t); });
+    }
+  } catch {}
+
+  // Deduplicate while preserving order
+  const seen = new Set();
+  const uniq = candidates.filter(p => p && !seen.has(p) && seen.add(p));
+
+  for (const p of uniq) {
+    try {
+      if (p && fs.existsSync(p)) {
+        // CHROME_BIN env pointing to missing file is a common misconfig — warn
+        if ((process.env.CHROME_BIN && p === process.env.CHROME_BIN) || (process.env.PUPPETEER_EXECUTABLE_PATH && p === process.env.PUPPETEER_EXECUTABLE_PATH)) {
+          console.log(`[CHROME] Env candidate exists: ${p}`);
+        }
+        return p;
+      }
+    } catch {}
+  }
+
+  // Log diagnostics if nothing found
+  console.warn('[CHROME] No candidate found after checking:');
+  uniq.forEach(p => {
+    let exists = false;
+    try { exists = fs.existsSync(p); } catch {}
+    console.warn(`  - ${p} ${exists ? '(exists but not selected?)' : '(missing)'}`);
+  });
+
+  // Fallback: try puppeteer's bundled/cached Chrome (may be Chrome for Testing)
+  try {
+    const puppeteer = _require('puppeteer');
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) {
+      console.log(`[CHROME] Using puppeteer cache: ${p}`);
+      return p;
+    } else if (p) {
+      console.warn(`[CHROME] Puppeteer cache path computed but missing: ${p}`);
+    }
+  } catch (e) {
+    console.warn(`[CHROME] Puppeteer cache lookup failed: ${e.message}`);
+  }
+
+  return undefined;
+}
+
+const chromePath = resolveChromePath();
+if (chromePath) {
+  console.log(`[CHROME] Using executable: ${chromePath}`);
+  // Persist to .env for next PM2 restart if not already set (dev convenience)
+  if (!process.env.CHROME_BIN && !process.env.PUPPETEER_EXECUTABLE_PATH) {
+    console.log(`[CHROME] Tip: set CHROME_BIN=${chromePath} in .env for stability`);
+  }
+} else {
+  const msg = 'No system Chrome/Chromium found and puppeteer cache empty';
+  console.warn(`[CHROME] ${msg}`);
+  console.warn('[CHROME] Fix Windows: ensure Chrome at C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe or set CHROME_BIN in .env');
+  console.warn('[CHROME] Fix Linux/Pi: sudo apt-get install chromium-browser  OR  npx puppeteer browsers install chrome');
+  lastLaunchError = msg + ' — checked candidates logged above';
+}
+
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: process.env.CLIENT_ID || 'latiabetina-bot' }),
-  puppeteer: { 
+  puppeteer: {
     headless: true,
-    executablePath: process.env.CHROME_BIN || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    executablePath: chromePath,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-extensions',
+    ],
   },
+});
+
+// Helper to initialize without crashing the process on Chrome-not-found
+function safeInitialize() {
+  client.initialize().catch(err => {
+    // Capture full error for /qr diagnostics
+    const msg = err?.message || String(err);
+    const stack = err?.stack || '';
+    lastLaunchError = msg + (stack ? `\n${stack.split('\n').slice(1,4).join('\n')}` : '');
+    console.error('[FATAL] Failed to launch Chrome:', msg);
+    console.error(stack);
+    if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found') || msg.includes('executablePath')) {
+      console.error('[HINT] Set CHROME_BIN or PUPPETEER_EXECUTABLE_PATH to a valid Chrome/Chromium binary.');
+      console.error('[HINT] Or install Chrome for puppeteer: npx puppeteer browsers install chrome');
+    } else if (msg.includes('Failed to launch') || msg.includes('ENOENT') || msg.includes('EACCES')) {
+      console.error('[HINT] Chrome binary found but failed to start — check permissions, --no-sandbox, or profile lock.');
+      console.error(`[HINT] Tried executable: ${chromePath || '(undefined — auto)'}`);
+    }
+    clientStatus = 'FAILED';
+    clearLoadingWatchdog();
+  });
+}
+
+// Prevent unhandled rejections (e.g. Chrome launch failure) from crashing the process
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.message || String(reason);
+  console.error('[UNHANDLED REJECTION]', msg);
+  if (!lastLaunchError) lastLaunchError = msg;
+  if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found') || msg.includes('Failed to launch')) {
+    clientStatus = 'FAILED';
+    clearLoadingWatchdog();
+  }
+});
+process.on('uncaughtException', (err) => {
+  const msg = err?.message || String(err);
+  if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found') || msg.includes('Failed to launch')) {
+    console.error('[UNCAUGHT]', msg);
+    if (!lastLaunchError) lastLaunchError = msg;
+    clientStatus = 'FAILED';
+    clearLoadingWatchdog();
+    return; // don't exit
+  }
+  console.error('[UNCAUGHT EXCEPTION]', err);
 });
 
 client.on('loading_screen', (percent, message) => {
@@ -271,7 +436,7 @@ client.on('auth_failure', msg => {
   setTimeout(() => {
     clientStatus = 'INITIALIZING';
     startLoadingWatchdog();
-    client.initialize();
+    safeInitialize();
   }, 3000);
 });
 
@@ -287,18 +452,43 @@ client.on('disconnected', (reason) => {
   setTimeout(() => {
     clientStatus = 'INITIALIZING';
     startLoadingWatchdog();
-    client.initialize();
+    safeInitialize();
   }, delay);
 });
 
 // Start the initial watchdog before first initialize
 startLoadingWatchdog();
-client.initialize();
+safeInitialize();
 
 const normalizePhone = phone => {
-  const digits = phone.replace(/\D/g, '');
+  let digits = phone.replace(/\D/g, '');
+  // Mexico: if 10-digit national number without country code, prepend 52
+  // Common formats: 8112345678 -> 528112345678 ; 528112345678 stays ; +52 811... -> 52811...
+  if (digits.length === 10) digits = `52${digits}`;
+  // If starts with 521 (old MX mobile prefix), WA expects 52 without 1: 521811... -> 52811...
+  if (digits.length === 13 && digits.startsWith('521')) digits = `52${digits.slice(3)}`;
   return `${digits}@c.us`;
 };
+
+// Helper: detect LID / invalid number errors from WA Web
+function isLidError(msg) {
+  if (!msg) return false;
+  const s = String(msg);
+  return s.includes('No LID') || s.includes('LID for user') || s.includes('Evaluation failed') && s.includes('LID') || s.includes('wid error');
+}
+function mapSendError(err) {
+  const raw = err?.message || String(err);
+  if (isLidError(raw)) {
+    return { status: 400, message: 'El número no está registrado en WhatsApp o es inválido (No LID). Verifique el número.' };
+  }
+  // getChat/undefined after send is often a post-send ack error — message was actually delivered
+  // Don't map to 503 (bot not ready) here; let caller decide. Return null so raw error is logged,
+  // and PHP job can treat it as warning + success if needed.
+  if (raw.includes('EBUSY') || raw.includes('File in use')) {
+    return { status: 409, message: 'WhatsApp está ocupado, intente nuevamente.' };
+  }
+  return null;
+}
 
 app.post('/api/send-message', authMiddleware, async (req, res) => {
   const { phone, message } = req.body;
@@ -313,16 +503,39 @@ app.post('/api/send-message', authMiddleware, async (req, res) => {
   if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
 
   try {
-    const number = normalizePhone(phone);
+    const rawNumber = normalizePhone(phone);
+    // Resolve to LID/c.us if possible, but NEVER block valid numbers that exist
+    // getNumberId can return null or @lid even for valid numbers due to privacy
+    let number = rawNumber;
+    try {
+      const numberId = await client.getNumberId(rawNumber);
+      if (numberId && numberId._serialized) {
+        number = numberId._serialized;
+        console.log(`[SEND] Resolved ${rawNumber} -> ${number}`);
+      } else {
+        console.warn(`[SEND] getNumberId null for ${rawNumber}, trying direct send`);
+      }
+    } catch (e) {
+      console.warn(`[SEND] getNumberId error for ${rawNumber}: ${e?.message} — trying direct send`);
+    }
     const sent = await client.sendMessage(number, message);
+    // whatsapp-web.js puede retornar undefined justo después de enviar (race en serialización id)
+    // si el mensaje ya se entregó (lo recibes), no lo trates como error
+    if (!sent || !sent.id || !sent.id._serialized) {
+      console.warn(`[SEND] sendMessage para ${number} retornó sin id pero probablemente entregado`, sent);
+      return res.json({ id: null, warning: 'Enviado sin id (entregado)' });
+    }
     return res.json({ id: sent.id._serialized });
   } catch (error) {
     console.error('Send message error', error);
-    let message = error.message;
-    if (message.includes('getChat') || message.includes('undefined')) {
-      message = "WhatsApp Bot session is not active. Please scan the QR code to authenticate.";
+    // Si el mensaje sí se envió pero falló el ack getChat, trátalo como éxito con warning
+    if (String(error?.message || '').includes("Cannot read properties of undefined (reading 'id')")) {
+      console.warn(`[SEND] id undefined pero mensaje a ${number} probablemente entregado`);
+      return res.json({ id: null, warning: 'Enviado (id no disponible)' });
     }
-    return res.status(500).json({ error: message });
+    const mapped = mapSendError(error);
+    if (mapped) return res.status(mapped.status).json({ error: mapped.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -340,7 +553,19 @@ app.post('/api/send-image', authMiddleware, async (req, res) => {
   if (!mediaUrl && !base64) return res.status(400).json({ error: 'mediaUrl or base64 is required' });
 
   try {
-    const number = normalizePhone(phone);
+    const rawNumber = normalizePhone(phone);
+    let number = rawNumber;
+    try {
+      const numberId = await client.getNumberId(rawNumber);
+      if (numberId && numberId._serialized) {
+        number = numberId._serialized;
+        console.log(`[SEND-IMAGE] Resolved ${rawNumber} -> ${number}`);
+      } else {
+        console.warn(`[SEND-IMAGE] getNumberId null for ${rawNumber}, trying direct send`);
+      }
+    } catch (e) {
+      console.warn(`[SEND-IMAGE] getNumberId error for ${rawNumber}: ${e?.message} — trying direct send`);
+    }
     let media;
     
     if (mediaUrl) {
@@ -350,14 +575,20 @@ app.post('/api/send-image', authMiddleware, async (req, res) => {
     }
 
     const sent = await client.sendMessage(number, media, { caption: message || '' });
+    if (!sent || !sent.id || !sent.id._serialized) {
+      console.warn(`[SEND-IMAGE] sendMessage para ${number} sin id pero probablemente entregado`, sent);
+      return res.json({ id: null, warning: 'Enviado sin id (entregado)' });
+    }
     return res.json({ id: sent.id._serialized });
   } catch (error) {
     console.error('Send image error', error);
-    let errorMsg = error.message;
-    if (errorMsg && (errorMsg.includes('getChat') || errorMsg.includes('undefined'))) {
-      errorMsg = "WhatsApp Bot session is not active. Please scan the QR code to authenticate.";
+    if (String(error?.message || '').includes("Cannot read properties of undefined (reading 'id')")) {
+      console.warn(`[SEND-IMAGE] id undefined pero mensaje a ${number} probablemente entregado`);
+      return res.json({ id: null, warning: 'Enviado (id no disponible)' });
     }
-    return res.status(500).json({ error: errorMsg });
+    const mapped = mapSendError(error);
+    if (mapped) return res.status(mapped.status).json({ error: mapped.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -380,6 +611,35 @@ app.get('/qr', authMiddleware, async (req, res) => {
             <h1>✅ WhatsApp is Ready</h1>
             <p>The bot is already authenticated and active.</p>
             <button onclick="location.href='/logout?pw=' + new URLSearchParams(window.location.search).get('pw')">Logout / Reset</button>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+
+  if (clientStatus === 'FAILED') {
+    const safeErr = (lastLaunchError || 'Unknown launch error — check server logs').replace(/</g,'&lt;');
+    const tried = (chromePath || 'auto (undefined)').replace(/</g,'&lt;');
+    return res.send(`
+      <html>
+        <head><title>Chrome Error</title>
+          <style>
+            body { background: #0f172a; color: white; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+            .card { background: rgba(239,68,68,0.1); padding: 2rem; border-radius: 1rem; text-align: center; border: 1px solid #ef4444; max-width: 700px; }
+            h1 { color: #ef4444; } code { background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; border-radius: 0.3rem; font-size: 0.85rem; word-break: break-all; }
+            pre { background: rgba(0,0,0,0.4); padding: 1rem; border-radius: 0.5rem; text-align: left; overflow: auto; font-size: 0.8rem; color: #f87171; white-space: pre-wrap; }
+            p { color: #94a3b8; text-align: left; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>❌ Chrome Launch Failed</h1>
+            <p><strong>Tried executable:</strong> <code>${tried}</code></p>
+            <pre>${safeErr}</pre>
+            <p><strong>Fix (Windows dev):</strong> Ensure Chrome is at <code>C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe</code> or set <code>CHROME_BIN</code> in .env to the full path.</p>
+            <p><strong>Fix (Linux/Raspberry Pi):</strong> <code>sudo apt-get update && sudo apt-get install -y chromium-browser</code> then set <code>CHROME_BIN=/usr/bin/chromium-browser</code> in .env, or run <code>npx puppeteer browsers install chrome</code> (requires network).</p>
+            <p><strong>Logs:</strong> Check <code>pm2 logs WhatsappBot</code> or <code>server_output.log</code> for full stack. Try <a href="/reset?pw=${req.query.pw}" style="color:#38bdf8">Reset</a> after fixing.</p>
+            <p><strong>Debug:</strong> <a href="/status?pw=${req.query.pw}" style="color:#38bdf8">/status</a> shows JSON with lastError.</p>
           </div>
         </body>
       </html>
@@ -489,7 +749,7 @@ app.get('/logout', authMiddleware, async (req, res) => {
     setTimeout(() => {
       clientStatus = 'INITIALIZING';
       startLoadingWatchdog();
-      client.initialize();
+      safeInitialize();
     }, 1000);
   } catch (err) {
     res.status(500).send('Logout failed: ' + err.message);
@@ -508,7 +768,7 @@ app.get('/reset', authMiddleware, async (req, res) => {
   setTimeout(() => {
     clientStatus = 'INITIALIZING';
     startLoadingWatchdog();
-    client.initialize();
+    safeInitialize();
   }, 2000);
   res.send(`
     <html>
@@ -537,7 +797,7 @@ app.get('/reset', authMiddleware, async (req, res) => {
 
 app.get('/status', authMiddleware, (req, res) => {
   console.log(`[${new Date().toISOString()}] Status check from ${req.ip}`);
-  res.json({ status: clientStatus, hasQr: !!lastQr });
+  res.json({ status: clientStatus, hasQr: !!lastQr, chromePath: chromePath || null, lastError: lastLaunchError || null, platform: process.platform });
 });
 
 app.get('/me', authMiddleware, (req, res) => {
